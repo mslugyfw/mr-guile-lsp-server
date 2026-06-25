@@ -1,0 +1,25 @@
+# Rust build artifacts
+/target
+debug/
+release/
+
+# Cargo lock is kept for binary crates (this is a binary, not a library)
+# Uncomment the next line if you prefer not to commit it:
+# Cargo.lock
+
+# Editor / OS
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+*.iml
+
+# Claude Code local settings (personal tooling, not part of the project)
+.claude/
+
+# Runtime caches the server writes (local dev; do not commit)
+# (these are under ~/.cache and /tmp at runtime, not in the repo, but guard
+#  against any stray local runs leaking artifacts here)
+/mr-guile-lsp-src-*.scm

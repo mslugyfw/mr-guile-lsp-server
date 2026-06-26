@@ -566,4 +566,32 @@ mod tests {
         assert_eq!(defs[1].range.start, pos(2, 0));
         assert_eq!(defs[1].range.end, pos(2, 14));
     }
+
+    #[test]
+    fn symbol_prefix_at_extracts_typed_prefix() {
+        // Cursor right after typing "my" inside "(my": prefix should be "my".
+        let text = "(define (foo x)\n  (* x 2))\n(my\n";
+        // line 2 = "(my", cursor at char 3 (just after 'y')
+        let (prefix, _range) = symbol_prefix_at(text, &pos(2, 3)).expect("prefix");
+        assert_eq!(prefix, "my");
+    }
+
+    #[test]
+    fn symbol_prefix_at_returns_none_on_whitespace() {
+        // Cursor on whitespace/empty line yields no prefix (no completion there).
+        let text = "(define (foo x)\n  x)\n";
+        // line 0 char 0 is '(', not a symbol char -> None
+        assert!(symbol_prefix_at(text, &pos(0, 0)).is_none());
+        // line 1 is "  x)" -> leading spaces at char 1 is whitespace -> None
+        assert!(symbol_prefix_at(text, &pos(1, 1)).is_none());
+    }
+
+    #[test]
+    fn symbol_prefix_at_full_symbol_when_cursor_at_end() {
+        // Cursor at the end of a whole symbol returns the whole symbol.
+        let text = "(display\n";
+        // "display" spans chars 1..8; cursor at char 8 (right after 'y')
+        let (prefix, _range) = symbol_prefix_at(text, &pos(0, 8)).expect("prefix");
+        assert_eq!(prefix, "display");
+    }
 }

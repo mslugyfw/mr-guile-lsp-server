@@ -119,13 +119,10 @@ async fn diagnose_uri(client: Client, documents: DocumentStore, repl: SharedRepl
     // Load into the REPL so Geiser can introspect user-defined symbols.
     let _ = repl_request(
         &repl,
-        &format!("(lsp-load-file {})", scheme_string(&path.to_string_lossy())),
+        &format!("(lsp-load-file {})", scheme_path(&path)),
     )
     .await;
-    let expr = format!(
-        "(lsp-check-syntax {})",
-        scheme_string(&path.to_string_lossy())
-    );
+    let expr = format!("(lsp-check-syntax {})", scheme_path(&path));
     let diags = match repl_request(&repl, &expr).await {
         Some(Ok(sexpr)) => {
             let warnings = sexpr
@@ -164,6 +161,15 @@ fn scheme_string(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// Render a filesystem path as a Guile string literal, normalizing Windows
+/// backslashes to forward slashes first. The MSYS2 Guile build treats `\` as an
+/// escape character inside paths (`\U`, `\s`, … are invalid escapes), so a
+/// `C:\Users\…` path breaks `canonicalize-path` / `open-file` even when
+/// properly escaped in Scheme. Forward slashes (`C:/Users/…`) work everywhere.
+fn scheme_path(path: &Path) -> String {
+    scheme_string(&path.to_string_lossy().replace('\\', "/"))
 }
 
 #[tower_lsp::async_trait]
@@ -469,9 +475,22 @@ impl LanguageServer for Backend {
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
         let query = params.query.to_lowercase();
+        // Prefer the workspace root from initialize; fall back to the directory
+        // of any open document (same heuristic as `references`) so symbol search
+        // still works when the client sent no rootUri.
         let root = match self.root.lock().await.clone() {
             Some(r) => r,
-            None => return Ok(None),
+            None => {
+                let inferred = self
+                    .documents
+                    .any_uri()
+                    .and_then(|u| u.to_file_path().ok())
+                    .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+                match inferred {
+                    Some(r) => r,
+                    None => return Ok(None),
+                }
+            }
         };
         tracing::info!(
             query = %params.query,

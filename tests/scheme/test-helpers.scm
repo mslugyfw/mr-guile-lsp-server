@@ -68,5 +68,29 @@
            #t))
   (delete-file tmp))
 
+;;; ---- module-aware completion & hover (RED tests for known gap) ---------
+;;; A baseline Scheme LSP must autocomplete identifiers defined inside a
+;;; `define-module` form, not only top-level defines in (guile-user). We load a
+;;; file that defines `(modtest)` exporting `mod-greet`, then expect completion
+;;; and documentation to find it.
+(let* ((tmp (string-append "/tmp/mr-guile-lsp-modtest-" (number->string (getpid)) ".scm")))
+  (call-with-output-file tmp
+    (lambda (p)
+      (display "(define-module (modtest)\n  #:export (mod-greet))\n"
+               p)
+      (display "(define (mod-greet who)\n  \"Greet WHO.\"\n  (string-append \"hi \" who))\n"
+               p)))
+  ;; Load it so Geiser can introspect (same path lsp-load-file takes).
+  (lsp-load-file tmp)
+  (let ((cs (lsp-completions "mod-greet")))
+    (check "completions-finds-module-exported-symbol"
+           (and (member "mod-greet" cs) #t)
+           #t))
+  (let ((doc (lsp-documentation 'mod-greet)))
+    (check "documentation-finds-module-exported-symbol"
+           (and (string? doc) (and (string-contains doc "Greet") #t))
+           #t))
+  (delete-file tmp))
+
 (format #t "\n~a failure(s)\n" failures)
 (exit (if (zero? failures) 0 1))

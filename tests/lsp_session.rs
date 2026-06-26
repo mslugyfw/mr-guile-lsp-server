@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::OnceLock;
 use std::time::Duration;
+use url::Url;
 use tempfile::TempDir;
 
 /// Path to the server binary (cargo sets CARGO_BIN_EXE_* at runtime).
@@ -138,7 +139,7 @@ fn full_lsp_session_drives_all_handlers() {
     let proj = TempDir::new().unwrap();
     let file = proj.path().join("main.scm");
     std::fs::write(&file, text).unwrap();
-    let uri = format!("file://{}", file.display());
+    let uri = Url::from_file_path(&file).unwrap().to_string();
 
     s.send(json!({
         "jsonrpc": "2.0", "method": "textDocument/didOpen",
@@ -209,8 +210,8 @@ fn goto_definition_finds_macro_in_another_file() {
     .unwrap();
     let use_file = proj.path().join("use.scm");
     std::fs::write(&use_file, "(my-when 42)\n").unwrap();
-    let use_uri = format!("file://{}", use_file.display());
-    let macros_uri = format!("file://{}/macros.scm", proj.path().display());
+    let use_uri = Url::from_file_path(&use_file).unwrap().to_string();
+    let macros_uri = Url::from_file_path(proj.path().join("macros.scm")).unwrap().to_string();
 
     s.send(json!({
         "jsonrpc": "2.0", "method": "textDocument/didOpen",
@@ -228,4 +229,101 @@ fn goto_definition_finds_macro_in_another_file() {
         resp["result"]["uri"], macros_uri,
         "cross-file macro should jump to its defining file: {resp}"
     );
+}
+
+/// references: finding all occurrences of a symbol across the workspace.
+/// The server scans .scm files in the workspace root for references.
+#[test]
+fn references_finds_usages_across_files() {
+    let mut s = Session::start();
+    let proj = TempDir::new().unwrap();
+    // lib.scm defines `helper`; caller.scm calls it twice.
+    std::fs::write(
+        proj.path().join("lib.scm"),
+        "(define (helper x) x)\n",
+    )
+    .unwrap();
+    let caller = proj.path().join("caller.scm");
+    std::fs::write(
+        &caller,
+        "(define (main)\n  (helper 1)\n  (helper 2))\n",
+    )
+    .unwrap();
+    let caller_uri = Url::from_file_path(&caller).unwrap().to_string();
+
+    s.send(json!({
+        "jsonrpc": "2.0", "method": "textDocument/didOpen",
+        "params": {"textDocument": {"uri": caller_uri, "languageId": "scheme", "version": 1,
+                     "text": "(define (main)\n  (helper 1)\n  (helper 2))\n"}}
+    }));
+    std::thread::sleep(Duration::from_millis(500));
+
+    // references on `helper` at line 1 col 3 (the first call's 'h').
+    s.send(json!({
+        "jsonrpc": "2.0", "id": 30, "method": "textDocument/references",
+        "params": {
+            "textDocument": {"uri": caller_uri},
+            "position": {"line": 1, "character": 3},
+            "context": {"includeDeclaration": true}
+        }
+    }));
+    let resp = s.response();
+    let result = resp["result"].as_array();
+    assert!(
+        result.map(|a| !a.is_empty()).unwrap_or(false),
+        "references should find `helper` usages across files: {resp}"
+    );
+    // Each location is in some .scm under the project.
+    if let Some(arr) = result {
+        for loc in arr {
+            assert!(
+                loc["uri"].as_str().unwrap_or("").ends_with(".scm"),
+                "reference location uri should be a .scm file: {loc}"
+            );
+        }
+    }
+}
+
+/// workspace/symbol: searching defined symbols by name across the workspace.
+#[test]
+fn workspace_symbol_finds_definition_by_query() {
+    let mut s = Session::start();
+    let proj = TempDir::new().unwrap();
+    // A file defining a uniquely-named function in the workspace.
+    std::fs::write(
+        proj.path().join("defs.scm"),
+        "(define (unique-name-fn a) a)\n",
+    )
+    .unwrap();
+    // We must open a document under the project for the server to track the
+    // workspace root. Open the defs file.
+    let defs_uri = Url::from_file_path(proj.path().join("defs.scm")).unwrap().to_string();
+    s.send(json!({
+        "jsonrpc": "2.0", "method": "textDocument/didOpen",
+        "params": {"textDocument": {"uri": defs_uri, "languageId": "scheme", "version": 1,
+                     "text": "(define (unique-name-fn a) a)\n"}}
+    }));
+    std::thread::sleep(Duration::from_millis(500));
+
+    s.send(json!({
+        "jsonrpc": "2.0", "id": 40, "method": "workspace/symbol",
+        "params": {"query": "unique-name-fn"}
+    }));
+    let resp = s.response();
+    let result = resp["result"].as_array();
+    assert!(
+        result.map(|a| !a.is_empty()).unwrap_or(false),
+        "workspace/symbol should find `unique-name-fn`: {resp}"
+    );
+    // The matched symbol's name should contain the query.
+    if let Some(arr) = result {
+        let names: Vec<&str> = arr
+            .iter()
+            .filter_map(|s| s["name"].as_str())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.contains("unique-name-fn")),
+            "matched symbol name should contain query: {names:?}"
+        );
+    }
 }

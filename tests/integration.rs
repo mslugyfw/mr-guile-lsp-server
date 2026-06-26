@@ -41,7 +41,10 @@ fn write_temp(name: &str, text: &str) -> PathBuf {
 }
 
 async fn check_syntax(repl: &mut GuileRepl, path: &Path) -> SExpr {
-    let expr = format!("(lsp-check-syntax \"{}\")", path.display());
+    // MSYS2 Guile treats `\` as an escape char in paths (`\U`, `\s` …); forward
+    // slashes work on Windows too, so normalize before handing to the REPL.
+    let guile_path = path.display().to_string().replace('\\', "/");
+    let expr = format!("(lsp-check-syntax \"{}\")", guile_path.replace('"', "\\\""));
     repl.request(&expr).await.expect("lsp-check-syntax")
 }
 
@@ -136,13 +139,50 @@ async fn completion_returns_matching_symbols() {
 }
 
 #[tokio::test]
+async fn completion_finds_module_exported_symbol() {
+    // A baseline Scheme LSP must complete identifiers defined inside a
+    // `define-module` form, not only top-level defines in (guile-user).
+    let mut repl = spawn_repl().await;
+    let path = write_temp(
+        "mr-guile-lsp-it-modcomp.scm",
+        "(define-module (modcomp)\n  #:export (mod-greet))\n(define (mod-greet who)\n  (string-append \"hi \" who))\n",
+    );
+    let guile_path = path.display().to_string().replace('\\', "/");
+    repl.request(&format!("(lsp-load-file \"{}\")", guile_path))
+        .await
+        .expect("load");
+
+    let result = repl
+        .request(r#"(lsp-completions "mod-greet")"#)
+        .await
+        .expect("completion");
+    let labels: Vec<String> = match result {
+        SExpr::List(items) => items
+            .iter()
+            .filter_map(|i| match i {
+                SExpr::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        other => panic!("expected a list, got {other:?}"),
+    };
+    assert!(
+        labels.iter().any(|s| s == "mod-greet"),
+        "module-exported symbol must be completable: {labels:?}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
 async fn hover_returns_user_docstring() {
     let mut repl = spawn_repl().await;
     let path = write_temp(
         "mr-guile-lsp-it-hover.scm",
         "(define (greet name)\n  \"Say hi\"\n  (string-append \"hi \" name))\n",
     );
-    repl.request(&format!("(lsp-load-file \"{}\")", path.display()))
+    let guile_path = path.display().to_string().replace('\\', "/");
+    repl.request(&format!("(lsp-load-file \"{}\")", guile_path))
         .await
         .expect("load");
 
@@ -164,7 +204,8 @@ async fn goto_finds_user_definition_line() {
         "mr-guile-lsp-it-goto.scm",
         "(define (alpha x) x)\n(define (beta y) y)\n",
     );
-    repl.request(&format!("(lsp-load-file \"{}\")", path.display()))
+    let guile_path = path.display().to_string().replace('\\', "/");
+    repl.request(&format!("(lsp-load-file \"{}\")", guile_path))
         .await
         .expect("load");
 

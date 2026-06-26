@@ -39,10 +39,14 @@ pub fn parse_error_output(raw: &str) -> Option<RawDiag> {
     if s.is_empty() {
         return None;
     }
-    let parts: Vec<&str> = s.splitn(4, ':').collect();
+    // Split off the path (may contain a drive-letter colon, e.g. `C:/...`).
+    let (_path, rest) = split_path_prefix(s)?;
+    // rest = ":<line>:<col>: <message>"
+    let parts: Vec<&str> = rest.splitn(4, ':').collect();
     if parts.len() < 4 {
         return None;
     }
+    // parts[0] is empty (the leading colon after the path).
     let line_num = parts[1].trim().parse::<u32>().ok()?;
     let col_num = parts[2].trim().parse::<u32>().ok()?;
     Some(RawDiag {
@@ -53,6 +57,13 @@ pub fn parse_error_output(raw: &str) -> Option<RawDiag> {
     })
 }
 
+/// Parse one Guile compile *warning* line into a diagnostic.
+///
+/// Line shape: `<path>:<line>:<col>: <severity>: <message...>`
+/// where `<path>` may itself contain colons — notably a Windows drive letter
+/// (`C:/...`) whose `:` must not be counted as a field separator. We therefore
+/// locate the `:line:col:` suffix (two consecutive numeric fields) rather than
+/// naively splitting on every colon.
 fn parse_line(line: &str) -> Option<RawDiag> {
     // Strip leading ";;;" comment markers and surrounding whitespace.
     let mut s = line.trim_start();
@@ -64,19 +75,25 @@ fn parse_line(line: &str) -> Option<RawDiag> {
         return None;
     }
 
-    // Shape: <path>:<line>:<col>: <severity>: <message...>
-    let parts: Vec<&str> = s.splitn(5, ':').collect();
-    if parts.len() < 5 {
+    // Split off the leading path, tolerating drive-letter colons (C:, D:).
+    // The remainder always begins with `:line:col: ...`.
+    let (_path, rest) = split_path_prefix(s)?;
+    // rest now looks like ":<line>:<col>: <severity>: <message...>"
+    let parts: Vec<&str> = rest.splitn(4, ':').collect();
+    if parts.len() < 4 {
         return None;
     }
+    // parts[0] is empty (the leading colon after the path).
     let line_num = parts[1].trim().parse::<u32>().ok()?;
     let col_num = parts[2].trim().parse::<u32>().ok()?;
-    let severity = match parts[3].trim() {
+    // parts[3] = "<severity>: <message...>" — split severity from message.
+    let (severity_field, message) = parts[3].split_once(':')?;
+    let severity = match severity_field.trim() {
         "warning" => DiagnosticSeverity::WARNING,
         "error" => DiagnosticSeverity::ERROR,
         _ => return None,
     };
-    let message = parts[4].trim().to_string();
+    let message = message.trim().to_string();
     Some(RawDiag {
         // Guile is 1-based; LSP is 0-based.
         line: line_num.saturating_sub(1),
@@ -84,6 +101,43 @@ fn parse_line(line: &str) -> Option<RawDiag> {
         severity,
         message,
     })
+}
+
+/// Split `s` into `(path, ":line:col: ...")`.
+///
+/// A Guile source path may contain a colon (a Windows drive letter `C:`), so we
+/// can't split on the first `:`. Instead we find the `:line:col:` suffix: the
+/// first colon whose following two `:`-separated fields are both numbers.
+fn split_path_prefix(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b':' && is_line_col_suffix(&s[i + 1..]) {
+            return Some((&s[..i], &s[i..]));
+        }
+    }
+    None
+}
+
+/// True if `s` starts with `<digits>:<digits>:` (the line and column fields).
+fn is_line_col_suffix(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut j = 0;
+    let n1 = take_digits(b, j);
+    if n1 == 0 || j + n1 >= b.len() || b[j + n1] != b':' {
+        return false;
+    }
+    j += n1 + 1;
+    let n2 = take_digits(b, j);
+    n2 > 0 && j + n2 < b.len() && b[j + n2] == b':'
+}
+
+/// Count leading ASCII digits of `b` at offset `from`.
+fn take_digits(b: &[u8], from: usize) -> usize {
+    let mut n = 0;
+    while from + n < b.len() && b[from + n].is_ascii_digit() {
+        n += 1;
+    }
+    n
 }
 
 /// Build LSP diagnostics for a document from Guile's raw compiler warning

@@ -54,6 +54,13 @@ impl DocumentStore {
     pub fn with_doc<R>(&self, uri: &Url, f: impl FnOnce(&Document) -> R) -> Option<R> {
         self.0.get(uri).map(|d| f(&d))
     }
+
+    /// Return any one open document's URI, if at least one is open. Used to
+    /// infer a workspace root (via the URI's parent dir) when the client sent
+    /// no rootUri.
+    pub fn any_uri(&self) -> Option<Url> {
+        self.0.iter().next().map(|e| e.key().clone())
+    }
 }
 
 impl Default for DocumentStore {

@@ -37,14 +37,51 @@
   #:use-module (mr-guile-lsp geiser evaluation)
   #:use-module (ice-9 session)
   #:use-module (ice-9 rdelim)
+  #:use-module (ice-9 regex)
   #:use-module (system base compile)
   #:use-module (srfi srfi-1))
 
+;; --- module tracking ----------------------------------------------------
+;; `lsp-load-file` records the modules a loaded buffer defines, so that
+;; completion / documentation can reach bindings that live in user modules
+;; (define-module forms) rather than only in the default (guile-user) module.
+(define *loaded-modules* (make-fluid '()))
+
+(define (remember-module! name)
+  (let ((cur (fluid-ref *loaded-modules*)))
+    (unless (member name cur)
+      (fluid-set! *loaded-modules* (cons name cur)))))
+
+(define (loaded-modules)
+  (fluid-ref *loaded-modules*))
+
 ;; --- completions --------------------------------------------------------
 ;; Geiser `completions` uses apropos-internal over loaded bindings, returning
-;; a sorted list of string labels matching the prefix.
+;; a sorted list of string labels matching the prefix. We also fold in the
+;; exported bindings of user modules tracked via `lsp-load-file`, so that
+;; symbols defined inside `define-module` forms are completable.
+(define (module-exported-labels mod-name)
+  ;; Return the string names of the exported bindings of MOD-NAME, or '().
+  (let ((mod (and (module-name? mod-name) (resolve-module mod-name #f #:ensure #f))))
+    (if (not mod)
+        '()
+        (let ((iface (module-public-interface mod)))
+          (if (not iface)
+              '()
+              ;; module-map calls (proc name var) over every binding; keep names.
+              (map symbol->string
+                   (module-map (lambda (name _var) name) iface)))))))
+
 (define (lsp-completions prefix)
-  (completions prefix))
+  (let* ((base (completions prefix))
+         (rx (string-append "^" (regexp-quote prefix)))
+         (from-modules
+          (append-map (lambda (m)
+                        (filter (lambda (s) (string-match rx s))
+                                (module-exported-labels m)))
+                      (loaded-modules)))
+         (all (delete-duplicates (append base from-modules))))
+    (sort! all string<?)))
 
 ;; --- documentation ------------------------------------------------------
 ;; `symbol-documentation` returns a nested alist whose "docstring" entry holds
@@ -60,8 +97,24 @@
         (else #f)))
 
 (define (lsp-documentation sym)
-  (let ((doc (symbol-documentation sym)))
-    (and doc (find-docstring doc))))
+  ;; Look up the docstring in the default module first, then in each tracked
+  ;; user module (define-module exports), so hover works on module-scoped
+  ;; symbols too.
+  (or (let ((doc (symbol-documentation sym)))
+        (and doc (find-docstring doc)))
+      (let loop ((mods (loaded-modules)))
+        (if (null? mods)
+            #f
+            (let* ((mod-name (car mods))
+                   (mod (and (module-name? mod-name)
+                             (resolve-module mod-name #f #:ensure #f)))
+                   (var (and mod (module-variable mod sym))))
+              (if (and var (variable-bound? var))
+                  (let ((val (variable-ref var)))
+                    (or (and (procedure? val)
+                             (procedure-documentation val))
+                        (loop (cdr mods))))
+                  (loop (cdr mods))))))))
 
 ;; --- signature ----------------------------------------------------------
 ;; `autodoc` returns ((name (args ((required ...) (optional ...) (key ...)))
@@ -173,11 +226,42 @@
 
 ;; --- load file into the REPL --------------------------------------------
 ;; Load `file-path` into the interaction environment so Geiser can introspect
-;; the symbols it defines (for completion/hover/definition of user code).
+;; the symbols it defines (for completion/hover/definition of user code). We
+;; also scan for `define-module` forms and remember the modules they declare,
+;; so completion/documentation can reach their exported bindings.
 ;; Errors are swallowed so a broken buffer never kills the REPL.
+
+(define (file-module-names file-path)
+  ;; Scan the top-level forms of FILE-PATH for (define-module (name ...) ...)
+  ;; and return the list of module name lists. Reads the file as data; any read
+  ;; error simply yields what was parsed so far.
+  (define (form->module-name form)
+    (and (pair? form)
+         (or (eq? (car form) 'define-module)
+             (equal? (car form) "define-module"))
+         (pair? (cdr form))
+         (let ((nm (cadr form)))
+           (and (or (pair? nm) (null? nm))
+                (every symbol? nm)
+                nm))))
+  (call-with-input-file file-path
+    (lambda (port)
+      (let loop ((acc '()))
+        (catch #t
+          (lambda ()
+            (let ((form (read port)))
+              (if (eof-object? form)
+                  (reverse! acc)
+                  (loop (let ((mn (form->module-name form)))
+                          (if mn (cons mn acc) acc))))))
+          (lambda args (reverse! acc)))))))
+
 (define (lsp-load-file file-path)
   (catch #t
-    (lambda () (ge:load-file file-path) #t)
+    (lambda ()
+      (for-each remember-module! (file-module-names file-path))
+      (ge:load-file file-path)
+      #t)
     (lambda args #f)))
 
 ;; --- sentinel request/response loop -------------------------------------

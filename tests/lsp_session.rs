@@ -17,9 +17,32 @@ use url::Url;
 use tempfile::TempDir;
 
 /// Path to the server binary (cargo sets CARGO_BIN_EXE_* at runtime).
+/// When running `cargo test` cargo does NOT build the binary target, so
+/// CARGO_BIN_EXE_* may be unset. In that case we use target/debug/<name>
+/// and build it on first access via CACHE so it's done exactly once.
 fn bin() -> String {
-    std::env::var("CARGO_BIN_EXE_mr_guile_lsp_server")
-        .unwrap_or_else(|_| "mr-guile-lsp-server".to_string())
+    static BIN: OnceLock<String> = OnceLock::new();
+    BIN.get_or_init(|| {
+        if let Ok(p) = std::env::var("CARGO_BIN_EXE_mr_guile_lsp_server") {
+            return p;
+        }
+        // cargo test doesn't build bin targets — ensure it exists.
+        let path = format!(
+            "{}/debug/mr-guile-lsp-server",
+            std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".into())
+        );
+        if !std::path::Path::new(&path).exists() {
+            let status = Command::new("cargo")
+                .args(["build", "--bin", "mr-guile-lsp-server"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("cargo build");
+            assert!(status.success(), "cargo build --bin failed");
+        }
+        path
+    })
+    .clone()
 }
 
 /// Shared isolated cache dir for the test binary (extracted once, reused).
